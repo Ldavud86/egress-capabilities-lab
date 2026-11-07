@@ -1,0 +1,213 @@
+# REFERENCE ONLY: not an active workflow. No checkout or third-party actions.
+name: Umma 03B capabilities only
+on:
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: umma-03b-capabilities
+  cancel-in-progress: false
+jobs:
+  capabilities:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Prepare local capability script
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          cat > "$RUNNER_TEMP/umma-03b-capabilities.sh" <<'UMMA_03B_SCRIPT'
+          #!/usr/bin/env bash
+          # Reference only. Requires a separate, expressly authorized Linux runner.
+          set -Eeuo pipefail
+          export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+          export LC_ALL=C
+          unset BASH_ENV ENV CDPATH
+          mode=${1:-}
+          [[ "$mode" == --run || "$mode" == --cleanup ]] || exit 1
+          [[ ${EUID} == 0 ]] || { echo 'NO DISPONIBLE: root supervisor required'; exit 2; }
+          [[ ${UMMA_03B_ID:-} =~ ^[0-9]+-[0-9]+$ ]] || exit 1
+          ns="umma03b-${UMMA_03B_ID}"
+          marker="/run/${ns}.owner"
+          principal=$(readlink /proc/self/ns/net)
+          final=FAIL
+          owned=0
+          created=0
+          inode=''
+          
+          report() { printf '%s: %s\n' "$1" "$2"; }
+          unavailable() { final='NO DISPONIBLE'; report "$final" "$1"; exit 2; }
+          fail() { final=FAIL; report FAIL "$1"; exit 1; }
+          
+          # Host-side operations are ONLY namespace lifecycle/ownership bookkeeping.
+          # Never apply ip address/link/route or nft commands in the principal namespace.
+          namespace_identity() {
+            local number
+            [[ ! -L "/run/netns/$ns" ]] || return 1
+            [[ $(stat -f -c %T "/run/netns/$ns") == nsfs ]] || return 1
+            number=$(stat -L -c %i "/run/netns/$ns") || return 1
+            [[ "$number" =~ ^[0-9]+$ ]] || return 1
+            printf 'net:[%s]\n' "$number"
+          }
+          
+          cleanup() {
+            local expected current pid remaining persisted
+            if [[ ! -e "/run/netns/$ns" && ! -L "/run/netns/$ns" && ! -e "$marker" && ! -L "$marker" ]]; then
+              return 0
+            fi
+            if [[ "$created" == 1 && "$inode" =~ ^net:\[[0-9]+\]$ ]]; then
+              # EXIT can recover from failed inspection or marker publication using the
+              # identity captured after successful creation, never the name alone.
+              expected=$inode
+            else
+              # A separate --cleanup process has no in-memory proof: require the marker.
+              [[ -f "$marker" && ! -L "$marker" && $(stat -c %u "$marker") == 0 && $(stat -c %a "$marker") == 600 ]] || return 1
+              expected=$(cat "$marker") || return 1
+            fi
+            [[ "$expected" =~ ^net:\[[0-9]+\]$ ]] || return 1
+            current=$(namespace_identity) || return 1
+            [[ "$current" == "$expected" && "$current" != "$principal" ]] || return 1
+            if [[ -e "$marker" || -L "$marker" ]]; then
+              [[ -f "$marker" && ! -L "$marker" && $(stat -c %u "$marker") == 0 && $(stat -c %a "$marker") == 600 ]] || return 1
+              persisted=$(cat "$marker") || return 1
+              # An empty/partial write is recoverable only with verified in-memory proof.
+              if [[ "$persisted" != "$expected" ]]; then
+                [[ "$created" == 1 && "$expected" == "$inode" && ( -z "$persisted" || "$expected" == "$persisted"* ) ]] || return 1
+              fi
+            fi
+            remaining=$(ip netns pids "$ns") || return 1
+            for pid in $remaining; do
+              [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+              # Recheck namespace before signaling; no unrelated host processes targeted.
+              if [[ $(readlink "/proc/$pid/ns/net" 2>/dev/null || true) == "$expected" ]]; then
+                kill -TERM "$pid" 2>/dev/null || true
+              fi
+            done
+            for _ in 1 2 3 4 5; do
+              remaining=$(ip netns pids "$ns") || return 1
+              [[ -n "$remaining" ]] || break
+              sleep 0.1
+            done
+            for pid in $remaining; do
+              if [[ $(readlink "/proc/$pid/ns/net" 2>/dev/null || true) == "$expected" ]]; then
+                kill -KILL "$pid" 2>/dev/null || true
+              fi
+            done
+            for _ in 1 2 3 4 5; do
+              remaining=$(ip netns pids "$ns") || return 1
+              [[ -n "$remaining" ]] || break
+              sleep 0.1
+            done
+            [[ -z "$remaining" ]] || return 1
+            [[ $(namespace_identity) == "$expected" ]] || return 1
+            ip netns delete "$ns" || return 1
+            [[ ! -e "/run/netns/$ns" ]] || return 1
+            if [[ -e "$marker" ]]; then rm -- "$marker" || return 1; fi
+            report PASS 'cleanup: zero processes before deletion; namespace handle removed'
+          }
+          
+          if [[ "$mode" == --cleanup ]]; then
+            if cleanup; then exit 0; else report FAIL 'fallback cleanup incomplete'; exit 1; fi
+          fi
+          
+          finish() {
+            local code=$?
+            trap - EXIT INT TERM
+            if [[ "$owned" == 1 ]]; then
+              if ! cleanup; then final=FAIL; code=1; report FAIL 'cleanup incomplete'; fi
+            fi
+            report "$final" 'overall capability assessment; NOT a firewall security result'
+            exit "$code"
+          }
+          trap finish EXIT
+          trap 'final=FAIL; exit 130' INT
+          trap 'final=FAIL; exit 143' TERM
+          
+          for tool in ip nft setpriv readlink stat cat awk uname sleep rm; do
+            command -v "$tool" >/dev/null || unavailable "missing tool: $tool (no installation)"
+          done
+          uname -sr
+          ip -Version
+          nft --version
+          setpriv --version
+          [[ ! -e "/run/netns/$ns" && ! -L "/run/netns/$ns" && ! -e "$marker" && ! -L "$marker" ]] || fail 'namespace or ownership marker already exists'
+          
+          # Creating/deleting a named namespace necessarily uses the host supervisor.
+          owned=1
+          if ! ip netns add "$ns"; then unavailable 'namespace creation denied or unsupported'; fi
+          created=1
+          inode=$(namespace_identity) || fail 'cannot capture new namespace identity; deletion forbidden without proof'
+          [[ "$inode" != "$principal" ]] || fail 'namespace isolation identity mismatch'
+          (umask 077; set -o noclobber; printf '%s\n' "$inode" > "$marker") || fail 'cannot record namespace ownership'
+          [[ $(ip netns exec "$ns" readlink /proc/self/ns/net) == "$inode" ]] || fail 'cannot inspect new namespace identity'
+          
+          inside() {
+            # Validate namespace identity again inside the process that will run the command.
+            ip netns exec "$ns" bash -c '
+              set -eu
+              expected=$1; principal=$2; shift 2
+              actual=$(readlink /proc/self/ns/net)
+              [ "$actual" = "$expected" ] && [ "$actual" != "$principal" ] || exit 90
+              exec "$@"
+            ' bash "$inode" "$principal" "$@"
+          }
+          
+          if ! inside ip link set lo up; then unavailable 'loopback configuration unavailable'; fi
+          if ! inside ip link add probe0 type dummy; then unavailable 'dummy interface unavailable'; fi
+          if ! inside ip link set probe0 up; then unavailable 'dummy activation unavailable'; fi
+          if ! inside ip address add 192.0.2.1/32 dev probe0; then unavailable 'IPv4 configuration unavailable'; fi
+          if ! inside ip -6 address add 2001:db8::1/128 dev probe0 nodad; then unavailable 'IPv6 configuration unavailable'; fi
+          inside ip -4 address show dev probe0
+          inside ip -6 address show dev probe0
+          inside ip -4 route show table all
+          inside ip -6 route show table all
+          [[ -z $(inside ip -4 route show default) ]] || fail 'unexpected IPv4 default route'
+          [[ -z $(inside ip -6 route show default) ]] || fail 'unexpected IPv6 default route'
+          report PASS 'IPv4/IPv6 configuration only; no packet transmission test'
+          
+          if ! inside nft list ruleset; then unavailable 'nftables kernel access unavailable'; fi
+          # --check validates only. No table, chain, rule or firewall policy is installed.
+          if ! printf 'table inet umma_cap_probe { }\n' | inside nft --check --file -; then
+            unavailable 'nftables check unavailable or incompatible (inspect error; not a security PASS)'
+          fi
+          report PASS 'nftables API and minimal check; no filtering demonstrated'
+          
+          if ! inside setpriv --reuid=65534 --regid=65534 --clear-groups \
+              --inh-caps=-all --ambient-caps=-all --bounding-set=-all --no-new-privs \
+              bash -c '
+                set -eu
+                test "$(readlink /proc/self/ns/net)" = "$1"
+                awk '\''
+                  /^Uid:|^Gid:/ { for (i=2;i<=5;i++) if ($i != 65534) bad=1; identities++ }
+                  /^Groups:/ { if (NF != 1) bad=1; groups++ }
+                  /^Cap(Inh|Prm|Eff|Bnd|Amb):/ { if ($2 !~ /^0+$/) bad=1; caps++ }
+                  /^NoNewPrivs:/ { if ($2 != 1) bad=1; nnp++ }
+                  END { exit (bad || identities!=2 || groups!=1 || caps!=5 || nnp!=1) }
+                '\'' /proc/self/status
+              ' bash "$inode"; then
+            fail 'unprivileged process setup or assertions failed; inspect output'
+          fi
+          report PASS 'UID/GID 65534; empty groups/capabilities; no_new_privs=1'
+          final=PASS
+          exit 0
+          UMMA_03B_SCRIPT
+          bash -n "$RUNNER_TEMP/umma-03b-capabilities.sh"
+      - name: Check capabilities (no network connections)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! sudo -n true; then
+            echo 'NO DISPONIBLE: noninteractive sudo unavailable'
+            exit 2
+          fi
+          sudo -n env UMMA_03B_ID="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" bash "$RUNNER_TEMP/umma-03b-capabilities.sh" --run
+      - name: Mandatory fallback cleanup
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f "$RUNNER_TEMP/umma-03b-capabilities.sh" ]]; then
+            sudo -n env UMMA_03B_ID="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" bash "$RUNNER_TEMP/umma-03b-capabilities.sh" --cleanup
+          else
+            echo 'NO DISPONIBLE: preparation did not produce a script; no capability run possible'
+          fi
