@@ -1,0 +1,345 @@
+# Reference only. Review before copying to an authorized repository.
+name: Umma 03B isolated firewall
+'on':
+  workflow_dispatch: {}
+permissions: {}
+concurrency:
+  group: umma-03b-firewall
+  cancel-in-progress: false
+jobs:
+  firewall:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Exercise private namespace policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          if ! command -v python3 >/dev/null || ! sudo -n true; then
+            echo 'NO DISPONIBLE: python3 or sudo unavailable'
+            exit 2
+          fi
+          candidate=$(mktemp "$RUNNER_TEMP/umma-firewall.XXXXXXXX")
+          trap 'rm -f -- "$candidate"' EXIT
+          cat > "$candidate" <<'UMMA_FIREWALL_SOURCE'
+          """Linux-only candidate. Direct execution requires explicit manual authorization."""
+          import contextlib
+          import ipaddress
+          import json
+          import os
+          from pathlib import Path
+          import secrets
+          import selectors
+          import shutil
+          import socket
+          import struct
+          import subprocess
+          import sys
+          import tempfile
+          import time
+          
+          
+          C4, A4, B4 = "192.0.2.1", "192.0.2.2", "10.77.0.2"
+          C6, A6, B6 = "2001:db8:3::1", "2001:db8:3::2", "fd03:b::2"
+          PORT, DNS = 18443, 1053
+          DEST = (A4, B4, A6, B6)
+          MAPPED = "::ffff:" + B4
+          NS = "/proc/self/ns/net"
+          SOURCE = Path(__file__).resolve()
+          QNAME = b"\x05probe\x04umma\x04test\x00"
+          
+          
+          class Unavailable(Exception):
+              pass
+          
+          
+          def require(condition, reason):
+              if not condition:
+                  raise RuntimeError(reason)
+          
+          
+          def control_line(stream, stage):
+              """Read one bounded ASCII frame. Only one command/reply is outstanding."""
+              deadline = time.monotonic() + 6
+              frame = bytearray()
+              with selectors.DefaultSelector() as waiting:
+                  waiting.register(stream, selectors.EVENT_READ)
+                  while len(frame) < 4096:
+                      remaining = deadline - time.monotonic()
+                      if remaining <= 0 or not waiting.select(remaining):
+                          raise TimeoutError(f"control timeout: {stage}")
+                      chunk = os.read(stream.fileno(), 4096 - len(frame))
+                      if not chunk:
+                          raise EOFError(f"control EOF: {stage}")
+                      frame.extend(chunk)
+                      if b"\n" in frame:
+                          require(frame.count(b"\n") == 1 and frame.endswith(b"\n"), f"unexpected control frames: {stage}")
+                          return frame[:-1].decode("ascii")
+              raise ValueError(f"oversize control frame: {stage}")
+          
+          
+          def cmd(*args, data=None):
+              return subprocess.run(args, input=data, text=True, check=True, timeout=6,
+                                    stdout=subprocess.PIPE).stdout
+          
+          
+          def emit(event, **values):
+              print(json.dumps({"event": event, **values}, sort_keys=True), flush=True)
+          
+          
+          def dedicated(parent):
+              actual = os.readlink(NS)
+              require(actual != parent, "namespace identity collision")
+              links = json.loads(cmd("ip", "-j", "link", "show"))
+              require([link["ifname"] for link in links] == ["lo"], "namespace not empty")
+              return actual
+          
+          
+          def restricted():
+              fields = dict(line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines())
+              for field in ("Uid", "Gid"):
+                  require(fields[field].split() == ["65534"] * 4, field)
+              require(not fields["Groups"].split(), "supplementary groups")
+              for field in ("CapEff", "CapPrm", "CapInh", "CapBnd", "CapAmb"):
+                  require(int(fields[field], 16) == 0, field)
+              require(fields["NoNewPrivs"].strip() == "1", "no_new_privs")
+          
+          
+          def probe(address, lookup, port, own, parent):
+              restricted()
+              require(os.readlink(NS) == own and own != parent, "probe namespace")
+              require(address in (*DEST, MAPPED) and port in (PORT, PORT + 1), "fixture endpoint")
+              if lookup:
+                  # Fixed A question to exactly one numeric, simulated DNS endpoint.
+                  ident = secrets.randbelow(65536)
+                  question = QNAME + struct.pack("!HH", 1, 1)
+                  request = struct.pack("!6H", ident, 0, 1, 0, 0, 0) + question
+                  with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+                      udp.settimeout(1)
+                      udp.connect((A4, DNS))
+                      udp.send(request)
+                      response = udp.recv(512)
+                  prefix = struct.pack("!6H", ident, 0x8400, 1, 1, 0, 0) + question
+                  prefix += struct.pack("!HHHIH", 0xc00c, 1, 1, 0, 4)
+                  require(len(response) == len(prefix) + 4 and response.startswith(prefix), "DNS fixture response")
+                  resolved = socket.inet_ntoa(response[-4:])
+                  require(resolved == address, "unexpected DNS generation")
+                  address = resolved
+              with socket.socket(socket.AF_INET6 if ":" in address else socket.AF_INET) as tcp:
+                  if address == MAPPED:
+                      tcp.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                      require(tcp.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY) == 0, "mapped socket mode")
+                  tcp.settimeout(0.8)
+                  try:
+                      tcp.connect((address, port))
+                  except TimeoutError:
+                      return "connect-timeout"
+                  require(tcp.recv(1) == b"K", "receiver acknowledgement")
+                  return "ack"
+          
+          
+          def server(parent, journal):
+              own = dedicated(parent)
+              Path(journal, "server").write_text(own)
+              print(own, flush=True)
+              require(control_line(sys.stdin, "server waiting for start") == "start", "missing start")
+              cmd("ip", "link", "set", "srv0", "up")
+              for addr in DEST:
+                  configure("srv0", addr, "/24" if addr == A4 else "/64" if addr == A6 else "/128" if ":" in addr else "/32")
+              counts = dict.fromkeys(DEST, 0)
+              answer = A4
+              queries = 0
+              with selectors.DefaultSelector() as sel, contextlib.ExitStack() as sockets:
+                  for addr, port in [*((addr, PORT) for addr in DEST), (A4, PORT + 1)]:
+                      s = sockets.enter_context(socket.socket(socket.AF_INET6 if ":" in addr else socket.AF_INET))
+                      s.bind((addr, port))
+                      s.listen(4)
+                      sel.register(s, selectors.EVENT_READ, addr)
+                  udp = sockets.enter_context(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
+                  udp.bind((A4, DNS))
+                  sel.register(udp, selectors.EVENT_READ, "dns")
+                  sel.register(sys.stdin, selectors.EVENT_READ, "control")
+                  print("ready", flush=True)
+                  while True:
+                      events = sel.select(timeout=12)
+                      if not events:
+                          raise TimeoutError("server idle: no control or fixture traffic")
+                      for key, _ in events:
+                          if key.data == "control":
+                              action = control_line(sys.stdin, "server command")
+                              if action == "stop":
+                                  return
+                              require(action in ("snapshot", "rotate"), "control")
+                              if action == "rotate":
+                                  answer = B4
+                              print(json.dumps({"accepts": counts, "dns": queries}), flush=True)
+                          elif key.data == "dns":
+                              msg, peer = udp.recvfrom(512)
+                              require(peer[0] == C4 and len(msg) == 12 + len(QNAME) + 4 and
+                                      msg[2:] == struct.pack("!5H", 0, 1, 0, 0, 0) + QNAME + struct.pack("!HH", 1, 1), "DNS query")
+                              queries += 1
+                              reply = msg[:2] + struct.pack("!5H", 0x8400, 1, 1, 0, 0) + msg[12:]
+                              udp.sendto(reply + struct.pack("!HHHIH", 0xc00c, 1, 1, 0, 4) + socket.inet_aton(answer), peer)
+                          else:
+                              conn, _ = key.fileobj.accept()
+                              with conn:
+                                  counts[key.data] += 1
+                                  conn.sendall(b"K")
+          
+          
+          def configure(dev, addr, prefix):
+              cmd("ip", "addr", "add", addr + prefix, "dev", dev, *(["nodad"] if ":" in addr else []))
+          
+          
+          RULES = f"""
+          table inet umma {{
+           counter denied4 {{ }}
+           counter denied6 {{ }}
+           counter other {{ }}
+           chain output {{
+            type filter hook output priority 0; policy drop;
+            oifname "cli0" ip6 hoplimit 255 icmpv6 type {{ nd-neighbor-solicit, nd-neighbor-advert }} accept
+            oifname "cli0" ip daddr {A4} udp dport {DNS} accept
+            oifname "cli0" ip daddr {A4} tcp dport {PORT} accept
+            oifname "cli0" ip6 daddr {A6} tcp dport {PORT} accept
+            ip daddr {B4} counter name denied4 drop
+            ip6 daddr {B6} counter name denied6 drop
+            counter name other drop
+           }}
+          }}
+          """
+          
+          
+          def counter(name):
+              state = json.loads(cmd("nft", "-j", "list", "counter", "inet", "umma", name))
+              return next(row["counter"]["packets"] for row in state["nftables"] if "counter" in row)
+          
+          
+          def lab(parent, journal):
+              own = dedicated(parent)
+              require(os.getpid() == 1, "dedicated PID namespace required")
+              Path(journal, "client").write_text(own)
+              srv = subprocess.Popen(["unshare", "--net", sys.executable, "-I", str(SOURCE), "server", own, journal],
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+              def send(message):
+                  srv.stdin.write(message + "\n")
+                  srv.stdin.flush()
+          
+              def snapshot(action="snapshot"):
+                  send(action)
+                  return json.loads(control_line(srv.stdout, f"reply to {action}"))
+          
+              def attempt(address, expected, rule=None, dns=False, port=PORT):
+                  address4 = ipaddress.ip_address(address)
+                  target = str(getattr(address4, "ipv4_mapped", None) or address4)
+                  before = snapshot()
+                  old = counter(rule) if rule else 0
+                  # Source on stdin avoids requiring uid 65534 to read the runner's temp directory.
+                  result = cmd("setpriv", "--reuid=65534", "--regid=65534", "--clear-groups",
+                               "--inh-caps=-all", "--ambient-caps=-all", "--bounding-set=-all",
+                               "--no-new-privs", sys.executable, "-I", "-", "probe", address, str(int(dns)), str(port), own, parent,
+                               data=SOURCE.read_text()).strip()
+                  after = snapshot()
+                  delta = counter(rule) - old if rule else 0
+                  received = after["accepts"][target] - before["accepts"][target]
+                  emit("attempt", address=address, port=port, dns=dns, observed=result, expected=expected,
+                       accepted=received, rule=rule, packets=delta, dns_queries=after["dns"]-before["dns"])
+                  require(result == expected and after["dns"] - before["dns"] == int(dns), "client/DNS mismatch")
+                  require(received == (1 if expected == "ack" else 0), "receiver mismatch")
+                  if rule:
+                      require(delta > 0, "drop counter unchanged")
+          
+              try:
+                  remote = control_line(srv.stdout, "server namespace identity")
+                  require(remote == os.readlink(f"/proc/{srv.pid}/ns/net") and remote not in (own, parent), "server identity")
+                  cmd("ip", "link", "add", "cli0", "type", "veth", "peer", "name", "srv0", "netns", str(srv.pid))
+                  cmd("ip", "link", "set", "cli0", "up")
+                  configure("cli0", C4, "/24")
+                  configure("cli0", C6, "/64")
+                  for family, addr in [("-4", B4), ("-6", B6)]:
+                      cmd("ip", family, "route", "add", addr, "dev", "cli0")
+                      require(not cmd("ip", family, "route", "show", "default").strip(), "unexpected default route")
+                  send("start")
+                  require(control_line(srv.stdout, "server ready") == "ready", "server startup")
+                  for addr in (*DEST, MAPPED):
+                      attempt(addr, "ack")
+                  attempt(A4, "ack", port=PORT + 1)
+                  cmd("nft", "-f", "-", data=RULES)
+                  emit("rules", ruleset=json.loads(cmd("nft", "-j", "list", "table", "inet", "umma")))
+                  for addr in (A4, A6):
+                      attempt(addr, "ack")
+                  for addr, rule in ((B4, "denied4"), (B6, "denied6"), (MAPPED, "denied4")):
+                      attempt(addr, "connect-timeout", rule)
+                  attempt(A4, "connect-timeout", "other", port=PORT + 1)
+                  attempt(A4, "ack", dns=True)
+                  snapshot("rotate")
+                  attempt(B4, "connect-timeout", "denied4", dns=True)
+                  for addr in (A4, A6):
+                      attempt(addr, "ack")
+                  cmd("nft", "delete", "table", "inet", "umma")
+                  for addr in (B4, B6, MAPPED):
+                      attempt(addr, "ack")
+                  attempt(A4, "ack", port=PORT + 1)
+                  send("stop")
+                  require(srv.wait(timeout=3) == 0, "server exit")
+              finally:
+                  if srv.poll() is None:
+                      srv.kill()
+                  srv.wait(timeout=3)
+                  srv.stdin.close()
+                  srv.stdout.close()
+          
+          
+          def supervisor():
+              for tool in ("unshare", "timeout", "ip", "nft", "setpriv"):
+                  if not shutil.which(tool):
+                      raise Unavailable("missing " + tool)
+              if os.geteuid() != 0:
+                  raise Unavailable("root supervisor required")
+              parent = os.readlink(NS)
+              emit("environment", kernel=os.uname().release, python=sys.version.split()[0],
+                   nft=cmd("nft", "--version").strip(), ip=cmd("ip", "-Version").strip())
+              with tempfile.TemporaryDirectory(prefix="umma03b-") as journal:
+                  # PID 1 termination reaps every descendant, including partial setup.
+                  try:
+                      subprocess.run(["timeout", "-k", "3", "75", "unshare", "--net", "--pid", "--fork",
+                                      "--kill-child=KILL", "--mount-proc", sys.executable, "-I", str(SOURCE),
+                                      "lab", parent, journal], check=True, timeout=85)
+                  finally:
+                      ids = {p.read_text() for p in Path(journal).iterdir()}
+                      require(os.readlink(NS) == parent and parent not in ids, "principal identity")
+                      for path in Path("/proc").glob("[0-9]*/ns/net"):
+                          try:
+                              current = os.readlink(path)
+                          except (FileNotFoundError, ProcessLookupError):
+                              continue
+                          except PermissionError:
+                              raise RuntimeError("incomplete namespace cleanup visibility")
+                          require(current not in ids, "surviving process in test namespace")
+                      emit("cleanup", observed_namespaces=sorted(ids), surviving_processes=0)
+                  require(len(ids) == 2, "missing namespace evidence")
+          
+          
+          if __name__ == "__main__":
+              try:
+                  mode, *args = sys.argv[1:]
+                  if mode == "--run-local-authorized" and not args:
+                      supervisor()
+                      emit("result", status="PASS")
+                  elif mode == "lab":
+                      lab(*args)
+                  elif mode == "server":
+                      server(*args)
+                  elif mode == "probe":
+                      print(probe(args[0], bool(int(args[1])), int(args[2]), *args[3:]))
+                  else:
+                      raise RuntimeError("authorization argument required")
+              except Unavailable as exc:
+                  emit("result", status="NO DISPONIBLE", reason=str(exc))
+                  sys.exit(2)
+              except Exception as exc:
+                  print(f"FAIL {type(exc).__name__}: {exc}", file=sys.stderr)
+                  sys.exit(1)
+          UMMA_FIREWALL_SOURCE
+          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C python3 -I "$candidate" --run-local-authorized
